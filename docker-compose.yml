@@ -1,0 +1,115 @@
+services:
+  # ── Kafka infrastructure ────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [zookeeper]
+    ports:
+      - "29092:29092"   # host access for debugging
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic iot-events --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic iot-aggregated --partitions 3 --replication-factor 1
+        echo 'Topics created: iot-events, iot-aggregated'
+
+  # ── PostgreSQL (device types reference) ────────────────────────────────────
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: iot_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql/ddl.sql:/docker-entrypoint-initdb.d/01_ddl.sql
+      - ./sql/dml.sql:/docker-entrypoint-initdb.d/02_dml.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d iot_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Flink cluster ───────────────────────────────────────────────────────────
+  flink-jobmanager:
+    build: ./flink_job
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        parallelism.default: 2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  flink-taskmanager:
+    build: ./flink_job
+    depends_on: [flink-jobmanager]
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+
+  # ── IoT message generator ───────────────────────────────────────────────────
+  generator:
+    build: ./generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: iot-events
+      EVENTS_PER_SECOND: 1
+
+  # ── Flink job submitter ─────────────────────────────────────────────────────
+  flink-job:
+    build: ./flink_job
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo 'Waiting for Kafka topics...'
+        sleep 20
+        flink run -m flink-jobmanager:8081 -py /opt/flink/usrlib/job.py -pyexec python3
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/iot_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
